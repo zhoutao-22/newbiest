@@ -1,4 +1,4 @@
-package com.newbiest.mms.rest.doc.issue.create;
+package com.newbiest.vanchip.rest.doc.issue.labmlot;
 
 import com.newbiest.base.msg.RequestBody;
 import io.swagger.annotations.ApiModel;
@@ -9,7 +9,7 @@ import java.util.List;
 
 @Data
 @ApiModel("具体请求操作信息")
-public class CreateIssueOrderRequestBody extends RequestBody {
+public class IssueLabMLotOrderRequestBody extends RequestBody {
 	
 	private static final long serialVersionUID = 1L;
 
@@ -20,5 +20,6 @@ public class CreateIssueOrderRequestBody extends RequestBody {
 	private String documentId;
 
 	@ApiModelProperty(value = "物料批次号")
-	private List<String> materialLotIdList;
+	private List<String> materialLotIds;
+
 }

@@ -62,14 +62,13 @@ public class PrintServiceImpl implements PrintService {
     @Async
     public void printMLot(MaterialLot materialLot) throws ClientException {
         try {
-            String transactionIp = ThreadLocalContext.getTransactionIp();
-            WorkStation workStation = workStationRepository.findByIpAddress(transactionIp);
+            WorkStation workStation = workStationRepository.findByIpAddress(ThreadLocalContext.getTransactionIp());
             if (workStation == null) {
-                throw new ClientParameterException(MmsException.MM_WORK_STATION_IS_NOT_EXIST, transactionIp);
+                throw new ClientParameterException(MmsException.MM_WORK_STATION_IS_NOT_EXIST, ThreadLocalContext.getTransactionIp());
             }
             LabelTemplate labelTemplate = labelTemplateRepository.findOneByName("PrintMLot");
             if (labelTemplate == null) {
-                throw new ClientParameterException(MmsException.MM_LBL_TEMPLATE_IS_NOT_EXIST, transactionIp);
+                throw new ClientParameterException(MmsException.MM_LBL_TEMPLATE_IS_NOT_EXIST);
             }
             List<LabelTemplateParameter> parameterList = labelTemplateParameterRepository.findByLblTemplateRrn(labelTemplate.getObjectRrn());
             labelTemplate.setLabelTemplateParameterList(parameterList);

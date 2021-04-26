@@ -1,7 +1,6 @@
 package com.newbiest.mms.print;
 
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.newbiest.base.exception.ClientParameterException;
 import com.newbiest.base.utils.CollectionUtils;
 import com.newbiest.base.utils.DateUtils;
@@ -14,7 +13,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
@@ -69,7 +67,7 @@ public class DefaultPrintStrategy implements IPrintStrategy {
     }
 
     public Map<String, Object> buildParameters(PrintContext printContext) {
-        Map<String, Object> parameterMap = Maps.newHashMap();
+        Map<String, Object> parameterMap = printContext.getParameterMap();
         List<LabelTemplateParameter> labelTemplateParameters = printContext.getLabelTemplate().getLabelTemplateParameterList();
         if (CollectionUtils.isNotEmpty(labelTemplateParameters)) {
             for (LabelTemplateParameter parameter : labelTemplateParameters) {
@@ -84,16 +82,22 @@ public class DefaultPrintStrategy implements IPrintStrategy {
                         log.warn(e.getMessage(), e);
                     }
                 }
-                if (value != null) {
-                    if (value instanceof Date) {
-                        SimpleDateFormat sdf = new SimpleDateFormat(DateUtils.DEFAULT_DATE_PATTERN);
-                        value = sdf.format(value);
-                    }
-                    value = String.valueOf(value);
-                } else {
+                if (value == null) {
                     value = parameter.getDefaultValue();
                 }
                 parameterMap.put(parameter.getName(), value);
+                log.debug("parameterName:" + parameter.getName() + ".value :" + value);
+            }
+        }
+
+        if (parameterMap != null && parameterMap.size() > 0) {
+            for (String key : parameterMap.keySet()) {
+                Object value = parameterMap.get(key);
+                if (value != null && value instanceof Date) {
+                    SimpleDateFormat sdf = new SimpleDateFormat(DateUtils.DEFAULT_DATE_PATTERN);
+                    value = sdf.format(value);
+                    parameterMap.put(key, value);
+                }
             }
         }
         parameterMap.put("printCount", printContext.getLabelTemplate().getPrintCount());

@@ -20,14 +20,12 @@ public interface VanChipService {
 
     void deleteIncomingMaterialLot(List<MaterialLot> materialLotList, String deleteNote) throws ClientException;
 
-    List<MaterialLot> getIssueOrderMLotParameter(String documentId) throws ClientException;
+    List<MaterialLot> getMLotByOrderId(String documentId) throws ClientException;
     void issueMLotByDoc(String documentId, List<String> materialLotIdList) throws ClientException;
-    void issueMLotByDocLine(DocumentLine documentLine, List<String> materialLotIdList) throws ClientException;
+    void issueMaterialByDoc(String documentId, List<String> materialLotIdList) throws ClientException;
+    void issueMLotByOrder(String documentId, List<String> materialLotIdList) throws ClientException;
 
     void returnMLotByDoc(String documentId, List<String> materialLotIdList) throws ClientException;
-
-    MaterialLot validationDocLineAndMaterialLot(DocumentLine documentLine, List<String> materialLotIdList) throws ClientException;
-    List<MaterialLot> getMLotByFIFO(DocumentLine documentLine) throws ClientException;
 
     List<MaterialLot> getReservedMaterialLot(DocumentLine documentLine) throws ClientException;
 
@@ -85,8 +83,9 @@ public interface VanChipService {
     void shipOutMobile(String documentId ,MaterialLotAction materialLotAction) throws ClientException;
     MaterialLotInventory checkMlotInventoryMobile(MaterialLotAction materialLotAction) throws ClientException;
 
-    void saveProduct(List<Product> dataList) throws ClientException;
-    void saveRawMaterial(List<RawMaterial> dataList) throws ClientException;
+    RawMaterial saveRawMaterial(RawMaterial rawMaterial) throws ClientException;
+    Product saveProduct(Product product) throws ClientException;
+    LabMaterial saveLabMaterial(LabMaterial material)throws ClientException;
 
     Storage saveStorageInfo(Storage storages) throws ClientException;
 }
