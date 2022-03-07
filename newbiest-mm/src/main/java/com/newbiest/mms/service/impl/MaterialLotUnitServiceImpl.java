@@ -94,22 +94,11 @@ public class MaterialLotUnitServiceImpl implements MaterialLotUnitService {
      * @return
      * @throws ClientException
      */
-    public List<MaterialLotUnit> receiveMLotWithUnit(MaterialLot materialLot, String warehouseName) throws ClientException {
+    public void receiveMLotWithUnit(MaterialLot materialLot, String warehouseName) throws ClientException {
         try {
-            List<MaterialLotUnit> materialLotUnitList = Lists.newArrayList();
             Warehouse warehouse = mmsService.getWarehouseByName(warehouseName);
             if (warehouse == null) {
                 throw new ClientParameterException(MmsException.MM_WAREHOUSE_IS_NOT_EXIST, warehouseName);
-            }
-            List<MaterialLotUnit> materialLotUnits = materialLotUnitRepository.findByMaterialLotId(materialLot.getMaterialLotId());
-            for (MaterialLotUnit materialLotUnit : materialLotUnits) {
-                materialLotUnit.setState(MaterialLotUnit.STATE_IN);
-                materialLotUnit = materialLotUnitRepository.saveAndFlush(materialLotUnit);
-
-                MaterialLotUnitHistory history = (MaterialLotUnitHistory) baseService.buildHistoryBean(materialLotUnit, MaterialLotUnitHistory.TRANS_TYPE_IN);
-                history.setTransQty(materialLotUnit.getCurrentQty());
-                materialLotUnitHisRepository.save(history);
-                materialLotUnitList.add(materialLotUnit);
             }
             Long warehouseRrn = warehouse.getObjectRrn();
             if(!StringUtils.isNullOrEmpty(materialLot.getReserved13())){
@@ -122,7 +111,9 @@ public class MaterialLotUnitServiceImpl implements MaterialLotUnitService {
             materialLotAction.setTransQty(materialLot.getCurrentQty());
             materialLotAction.setTransCount(materialLot.getCurrentSubQty());
             mmsService.stockIn(materialLot, materialLotAction);
-            return materialLotUnitList;
+
+            mmsService.stockInMaterialLotUnitAndSaveHis(materialLot, MaterialLotUnitHistory.TRANS_TYPE_IN);
+
         } catch (Exception e) {
             throw ExceptionManager.handleException(e, log);
         }
@@ -143,6 +134,14 @@ public class MaterialLotUnitServiceImpl implements MaterialLotUnitService {
                     throw new ClientParameterException(MmsException.MM_MATERIAL_LOT_UNIT_ID_REPEATS, unitId);
                 }
             }
+            Map<String, List<MaterialLotUnit>> materialLotMap = materialLotUnitList.stream().collect(Collectors.groupingBy(MaterialLotUnit :: getLotId));
+            for(String lotId : materialLotMap.keySet()){
+                MaterialLot materialLotInfo = materialLotRepository.findByLotIdAndStatusCategoryNotIn(lotId, MaterialLot.STATUS_FIN);
+                if(materialLotInfo != null){
+                    throw new ClientParameterException(MmsException.MM_MATERIAL_LOT_IS_EXIST, lotId);
+                }
+            }
+
             //生成导入编码
             String importCode = "";
             if(StringUtils.isNullOrEmpty(materialLotUnitList.get(0).getReserved48())){
@@ -161,12 +160,6 @@ public class MaterialLotUnitServiceImpl implements MaterialLotUnitService {
                 }
                 StatusModel statusModel = mmsService.getMaterialStatusModel(material);
                 Map<String, List<MaterialLotUnit>> materialLotUnitMap = materialUnitMap.get(materialName).stream().collect(Collectors.groupingBy(MaterialLotUnit :: getLotId));
-                for(String lotId : materialLotUnitMap.keySet()){
-                    MaterialLot materialLotInfo = materialLotRepository.findByLotIdAndStatusCategoryNotIn(lotId, MaterialLot.STATUS_FIN);
-                    if(materialLotInfo != null){
-                        throw new ClientParameterException(MmsException.MM_MATERIAL_LOT_IS_EXIST, lotId);
-                    }
-                }
                 for (String lotId : materialLotUnitMap.keySet()) {
                     List<MaterialLotUnit> materialLotUnits = materialLotUnitMap.get(lotId);
 

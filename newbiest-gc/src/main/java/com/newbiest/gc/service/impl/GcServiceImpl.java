@@ -149,6 +149,9 @@ public class GcServiceImpl implements GcService {
     MaterialIssueOrderRepository materialIssueOrderRepository;
 
     @Autowired
+    FtRetestOrderRepository ftRetestOrderRepository;
+
+    @Autowired
     ErpSobOrderRepository erpSobOrderRepository;
 
     @Autowired
@@ -575,13 +578,10 @@ public class GcServiceImpl implements GcService {
      * @param mLotId
      * @return materialLot
      */
-    public MaterialLot getWaitStockInStorageMaterialLotByLotIdOrMLotId(String mLotId) throws ClientException{
+    public MaterialLot getWaitStockInStorageMaterialLotByLotIdOrMLotId(String mLotId, Long tableRrn) throws ClientException{
         try {
-            MaterialLot materialLot = materialLotRepository.findByMaterialLotIdAndOrgRrn(mLotId,  ThreadLocalContext.getOrgRrn());
-            if(materialLot == null){
-                materialLot = materialLotRepository.findByLotIdAndStatusCategoryNotIn(mLotId, MaterialLot.STATUS_FIN);
-            }
-            if(materialLot == null){
+            MaterialLot materialLot = getMaterialLotByTableRrnAndMaterialLotIdOrLotId(tableRrn, mLotId);
+            if(StringUtils.isNullOrEmpty(materialLot.getMaterialLotId())){
                 throw new ClientParameterException(MmsException.MM_MATERIAL_LOT_IS_NOT_EXIST, mLotId);
             } else{
                 materialLot.isFinish();
@@ -1085,6 +1085,134 @@ public class GcServiceImpl implements GcService {
     }
 
     /**
+     * 同步重测单据
+     * @throws ClientException
+     */
+    public void asyncReTestOrder() throws ClientException {
+        try {
+            List<ErpMaterialOutOrder> erpMaterialOutOrders = erpMaterialOutOrderRepository.findByTypeAndSynStatusNotIn(ErpMaterialOutOrder.TYPE_RO, Lists.newArrayList(ErpSo.SYNC_STATUS_OPERATION, ErpSo.SYNC_STATUS_SYNC_ERROR, ErpSo.SYNC_STATUS_SYNC_SUCCESS));
+            List<Long> asyncSuccessSeqList = Lists.newArrayList();
+            List<Long> asyncDuplicateSeqList = Lists.newArrayList();
+
+            if (CollectionUtils.isNotEmpty(erpMaterialOutOrders)) {
+                Map<String, List<ErpMaterialOutOrder>> documentIdMap = erpMaterialOutOrders.stream().collect(Collectors.groupingBy(ErpMaterialOutOrder :: getCcode));
+                for (String documentId : documentIdMap.keySet()) {
+                    List<ErpMaterialOutOrder> documentIdList = documentIdMap.get(documentId);
+                    //把即将同步的同Ccode数据按createseq分组
+                    Map<String, List<ErpMaterialOutOrder>> sameCreateSeqOrder = documentIdList.stream().filter(erpMaterialOutOrder -> !StringUtils.isNullOrEmpty(erpMaterialOutOrder.getCreateSeq()))
+                            .collect(Collectors.groupingBy(ErpMaterialOutOrder :: getCreateSeq));
+                    List<ReTestOrder> reTestOrderList = reTestOrderRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
+                    if(CollectionUtils.isEmpty(reTestOrderList)){
+                        List<Document> documentList = documentRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
+                        if(CollectionUtils.isNotEmpty(documentList)){
+                            updateErpMaterialOutErrorInfo(documentIdList);
+                            continue;
+                        }
+                    }
+                    ReTestOrder reTestOrder;
+                    BigDecimal totalQty = BigDecimal.ZERO;
+                    if (CollectionUtils.isEmpty(reTestOrderList)) {
+                        //如果有不同create_seq
+                        if(sameCreateSeqOrder.keySet().size() > 1 ){
+                            for  (ErpMaterialOutOrder erpMaterialOutOrder : documentIdList) {
+                                asyncDuplicateSeqList.add(erpMaterialOutOrder.getSeq());
+                            }
+                            continue;
+                        }
+                        reTestOrder = new ReTestOrder();
+                        reTestOrder.setName(documentId);
+                        reTestOrder.setStatus(Document.STATUS_OPEN);
+                        reTestOrder.setReserved31(ErpMaterialOutOrder.SOURCE_TABLE_NAME);
+                    } else {
+                        reTestOrder = reTestOrderList.get(0);
+                        totalQty = reTestOrder.getQty();
+                        boolean differentCreateSeq = false;
+                        for  (String createSeq : sameCreateSeqOrder.keySet()) {
+                            if(!createSeq.equals(reTestOrder.getReserved32())){
+                                differentCreateSeq = true;
+                                for  (ErpMaterialOutOrder erpMaterialOutOrder : documentIdList) {
+                                    asyncDuplicateSeqList.add(erpMaterialOutOrder.getSeq());
+                                }
+                                break;
+                            }
+                        }
+                        if(differentCreateSeq){
+                            continue;
+                        }
+                    }
+                    reTestOrder.setName(documentId);
+
+                    List<DocumentLine> documentLines = Lists.newArrayList();
+                    for  (ErpMaterialOutOrder erpMaterialOutOrder : documentIdMap.get(documentId)) {
+                        try {
+                            DocumentLine documentLine = null;
+                            if (reTestOrder.getObjectRrn() != null) {
+                                documentLine = documentLineRepository.findByDocRrnAndReserved1(reTestOrder.getObjectRrn(), String.valueOf(erpMaterialOutOrder.getSeq()));
+                                if (documentLine != null) {
+                                    if (ErpSo.SYNC_STATUS_CHANGED.equals(erpMaterialOutOrder.getSynStatus())) {
+                                        if (documentLine != null && documentLine.getHandledQty().compareTo(erpMaterialOutOrder.getIquantity()) > 0) {
+                                            throw new ClientException("gc.order_handled_qty_gt_qty");
+                                        }
+                                    }
+                                }
+                            }
+                            // 当系统中已经同步过这个数据，则除了数量栏位，其他都不能改
+                            if (documentLine == null) {
+                                documentLine = new DocumentLine();
+                                Material material = mmsService.getProductByName(erpMaterialOutOrder.getCinvcode());
+                                if (material == null) {
+                                    throw new ClientParameterException(MM_PRODUCT_ID_IS_NOT_EXIST, erpMaterialOutOrder.getCinvcode());
+                                }
+                                documentLine.setDocId(documentId);
+                                documentLine.setErpCreated(DateUtils.parseDate(erpMaterialOutOrder.getDdate()));
+                                documentLine.setMaterialRrn(material.getObjectRrn());
+                                documentLine.setMaterialName(material.getName());
+                                documentLine.setReserved9(ReTestOrder.CATEGORY_RETEST);
+
+                                erpMaterialOutOrderSetDocumentLine(documentLine, erpMaterialOutOrder);
+                            }
+
+                            totalQty = totalQty.add(erpMaterialOutOrder.getIquantity().subtract(documentLine.getQty()));
+                            documentLine.setQty(erpMaterialOutOrder.getIquantity());
+                            documentLine.setUnHandledQty(documentLine.getQty().subtract(documentLine.getHandledQty()));
+                            documentLines.add(documentLine);
+
+                            reTestOrder.setOwner(erpMaterialOutOrder.getChandler());
+                            reTestOrder.setReserved32(erpMaterialOutOrder.getCreateSeq());
+                            asyncSuccessSeqList.add(erpMaterialOutOrder.getSeq());
+                        } catch (Exception e) {
+                            // 修改状态为2
+                            erpMaterialOutOrder.setUserId(Document.SYNC_USER_ID);
+                            erpMaterialOutOrder.setSynStatus(ErpSo.SYNC_STATUS_SYNC_ERROR);
+                            erpMaterialOutOrder.setErrorMemo(e.getMessage());
+                            erpMaterialOutOrderRepository.save(erpMaterialOutOrder);
+                        }
+                    }
+                    if(totalQty.compareTo(BigDecimal.ZERO) > 0){
+                        reTestOrder.setQty(totalQty);
+                        reTestOrder.setUnHandledQty(reTestOrder.getQty().subtract(reTestOrder.getHandledQty()));
+                        reTestOrder.setReserved31(ErpMaterialOutOrder.SOURCE_TABLE_NAME);
+                        reTestOrder = (ReTestOrder) baseService.saveEntity(reTestOrder);
+                    }
+
+                    for (DocumentLine documentLine : documentLines) {
+                        documentLine.setDoc(reTestOrder);
+                        baseService.saveEntity(documentLine);
+                    }
+
+                    // 保存单据的时候同步下客户
+                    if (!StringUtils.isNullOrEmpty(reTestOrder.getSupplierName())) {
+                        savaCustomer(reTestOrder.getSupplierName());
+                    }
+                }
+                updateErpMaterialOutSyncStatusAndErrorMemoAndUserId(asyncSuccessSeqList, asyncDuplicateSeqList);
+            }
+        } catch (Exception e) {
+            throw ExceptionManager.handleException(e, log);
+        }
+    }
+
+    /**
      * 同步wafer发料单据
      * @throws ClientException
      */
@@ -1103,14 +1231,9 @@ public class GcServiceImpl implements GcService {
                             .collect(Collectors.groupingBy(ErpMaterialOutOrder :: getCreateSeq));
                     List<WaferIssueOrder> waferIssueOrderList = waferIssueOrderRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
                     if(CollectionUtils.isEmpty(waferIssueOrderList)){
-                        List<Document> documentList = documentRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
-                        if(CollectionUtils.isNotEmpty(documentList)){
-                            for(ErpMaterialOutOrder erpMaterialOutOrder : documentIdList){
-                                erpMaterialOutOrder.setUserId(Document.SYNC_USER_ID);
-                                erpMaterialOutOrder.setSynStatus(ErpSo.SYNC_STATUS_SYNC_ERROR);
-                                erpMaterialOutOrder.setErrorMemo(ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID);
-                                erpMaterialOutOrderRepository.save(erpMaterialOutOrder);
-                            }
+                        List<Document> documents = documentRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
+                        if(CollectionUtils.isNotEmpty(documents)){
+                            updateErpMaterialOutErrorInfo(documentIdList);
                             continue;
                         }
                     }
@@ -1173,17 +1296,8 @@ public class GcServiceImpl implements GcService {
                                 documentLine.setErpCreated(DateUtils.parseDate(erpMaterialOutOrder.getDdate()));
                                 documentLine.setMaterialRrn(material.getObjectRrn());
                                 documentLine.setMaterialName(material.getName());
-                                documentLine.setReserved1(String.valueOf(erpMaterialOutOrder.getSeq()));
-                                documentLine.setReserved2(erpMaterialOutOrder.getSecondcode());
-                                documentLine.setReserved3(erpMaterialOutOrder.getGrade());
-                                documentLine.setReserved4(erpMaterialOutOrder.getCfree3());
-                                documentLine.setReserved5(erpMaterialOutOrder.getCmaker());
-                                documentLine.setReserved6(erpMaterialOutOrder.getChandler());
-                                documentLine.setReserved7(erpMaterialOutOrder.getOther1());
-                                documentLine.setReserved8(erpMaterialOutOrder.getCusname());
                                 documentLine.setReserved9(waferIssueOrder.CATEGORY_WAFER_ISSUE);
-                                documentLine.setReserved13(erpMaterialOutOrder.getCmemo());
-                                documentLine.setReserved31(ErpMaterialOutOrder.SOURCE_TABLE_NAME);
+                                erpMaterialOutOrderSetDocumentLine(documentLine, erpMaterialOutOrder);
                             }
 
                             totalQty = totalQty.add(erpMaterialOutOrder.getIquantity().subtract(documentLine.getQty()));
@@ -1219,26 +1333,57 @@ public class GcServiceImpl implements GcService {
                         savaCustomer(waferIssueOrder.getSupplierName());
                     }
                 }
-                if (CollectionUtils.isNotEmpty(asyncSuccessSeqList)) {
-                    if(asyncSuccessSeqList.size() >= Document.SEQ_MAX_LENGTH){
-                        List<List<Long>> asyncSuccessSeqGroupList = getSeqListGroupByCount(asyncSuccessSeqList);
-                        for(List seqGroup : asyncSuccessSeqGroupList){
-                            erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_SUCCESS, StringUtils.EMPTY, Document.SYNC_USER_ID, seqGroup);
-                        }
-                    } else {
-                        erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_SUCCESS, StringUtils.EMPTY, Document.SYNC_USER_ID, asyncSuccessSeqList);
+                updateErpMaterialOutSyncStatusAndErrorMemoAndUserId(asyncSuccessSeqList, asyncDuplicateSeqList);
+            }
+        } catch (Exception e) {
+            throw ExceptionManager.handleException(e, log);
+        }
+    }
+
+    /**
+     * 记录单据错误信息
+     * @param documentIdList
+     * @throws ClientException
+     */
+    private void updateErpMaterialOutErrorInfo(List<ErpMaterialOutOrder> documentIdList) throws ClientException{
+        try {
+            for(ErpMaterialOutOrder erpMaterialOutOrder : documentIdList){
+                erpMaterialOutOrder.setUserId(Document.SYNC_USER_ID);
+                erpMaterialOutOrder.setSynStatus(ErpSo.SYNC_STATUS_SYNC_ERROR);
+                erpMaterialOutOrder.setErrorMemo(ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID);
+                erpMaterialOutOrderRepository.save(erpMaterialOutOrder);
+            }
+        } catch (Exception e) {
+            throw ExceptionManager.handleException(e, log);
+        }
+    }
+
+    /**
+     * 修改erpmaerialOut表
+     * @param asyncSuccessSeqList
+     * @param asyncDuplicateSeqList
+     * @throws ClientException
+     */
+    private void updateErpMaterialOutSyncStatusAndErrorMemoAndUserId(List<Long> asyncSuccessSeqList, List<Long> asyncDuplicateSeqList) throws ClientException{
+        try {
+            if (CollectionUtils.isNotEmpty(asyncSuccessSeqList)) {
+                if(asyncSuccessSeqList.size() >= Document.SEQ_MAX_LENGTH){
+                    List<List<Long>> asyncSuccessSeqGroupList = getSeqListGroupByCount(asyncSuccessSeqList);
+                    for(List seqGroup : asyncSuccessSeqGroupList){
+                        erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_SUCCESS, StringUtils.EMPTY, Document.SYNC_USER_ID, seqGroup);
                     }
+                } else {
+                    erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_SUCCESS, StringUtils.EMPTY, Document.SYNC_USER_ID, asyncSuccessSeqList);
                 }
-                if (CollectionUtils.isNotEmpty(asyncDuplicateSeqList)) {
-                    if(asyncDuplicateSeqList.size() >= Document.SEQ_MAX_LENGTH){
-                        List<List<Long>> asyncDuplicateSeqGroupList = getSeqListGroupByCount(asyncDuplicateSeqList);
-                        for(List seqGroup : asyncDuplicateSeqGroupList){
-                            erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpMaterialOutaOrder.SYNC_STATUS_SYNC_ERROR,
-                                    ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID, Document.SYNC_USER_ID, seqGroup);                        }
-                    } else {
-                        erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpMaterialOutaOrder.SYNC_STATUS_SYNC_ERROR,
-                                ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID, Document.SYNC_USER_ID, asyncDuplicateSeqList);
+            }
+            if (CollectionUtils.isNotEmpty(asyncDuplicateSeqList)) {
+                if(asyncDuplicateSeqList.size() >= Document.SEQ_MAX_LENGTH){
+                    List<List<Long>> asyncDuplicateSeqGroupList = getSeqListGroupByCount(asyncDuplicateSeqList);
+                    for(List seqGroup : asyncDuplicateSeqGroupList){
+                        erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_ERROR, ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID, Document.SYNC_USER_ID, seqGroup);
                     }
+                } else {
+                    erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_ERROR, ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID, Document.SYNC_USER_ID, asyncDuplicateSeqList);
                 }
             }
         } catch (Exception e) {
@@ -1247,161 +1392,44 @@ public class GcServiceImpl implements GcService {
     }
 
     /**
-     * 同步重测单据
+     * erpMaterialOutOrder表栏位赋值
+     * @param documentLine
+     * @param erpMaterialOutOrder
      * @throws ClientException
      */
-    public void asyncReTestOrder() throws ClientException {
+    private void erpMaterialOutOrderSetDocumentLine(DocumentLine documentLine, ErpMaterialOutOrder erpMaterialOutOrder) throws ClientException{
         try {
-            List<ErpMaterialOutOrder> erpMaterialOutOrders = erpMaterialOutOrderRepository.findByTypeAndSynStatusNotIn(ErpMaterialOutOrder.TYPE_RO, Lists.newArrayList(ErpSo.SYNC_STATUS_OPERATION, ErpSo.SYNC_STATUS_SYNC_ERROR, ErpSo.SYNC_STATUS_SYNC_SUCCESS));
-            List<Long> asyncSuccessSeqList = Lists.newArrayList();
-            List<Long> asyncDuplicateSeqList = Lists.newArrayList();
-
-            if (CollectionUtils.isNotEmpty(erpMaterialOutOrders)) {
-                Map<String, List<ErpMaterialOutOrder>> documentIdMap = erpMaterialOutOrders.stream().collect(Collectors.groupingBy(ErpMaterialOutOrder :: getCcode));
-                for (String documentId : documentIdMap.keySet()) {
-                    List<ErpMaterialOutOrder> documentIdList = documentIdMap.get(documentId);
-                    //把即将同步的同Ccode数据按createseq分组
-                    Map<String, List<ErpMaterialOutOrder>> sameCreateSeqOrder = documentIdList.stream().filter(erpMaterialOutOrder -> !StringUtils.isNullOrEmpty(erpMaterialOutOrder.getCreateSeq()))
-                            .collect(Collectors.groupingBy(ErpMaterialOutOrder :: getCreateSeq));
-                    List<ReTestOrder> reTestOrderList = reTestOrderRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
-                    if(CollectionUtils.isEmpty(reTestOrderList)){
-                        List<Document> documentList = documentRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
-                        if(CollectionUtils.isNotEmpty(documentList)){
-                            for(ErpMaterialOutOrder erpMaterialOutOrder : documentIdList){
-                                erpMaterialOutOrder.setUserId(Document.SYNC_USER_ID);
-                                erpMaterialOutOrder.setSynStatus(ErpSo.SYNC_STATUS_SYNC_ERROR);
-                                erpMaterialOutOrder.setErrorMemo(ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID);
-                                erpMaterialOutOrderRepository.save(erpMaterialOutOrder);
-                            }
-                            continue;
-                        }
-                    }
-                    ReTestOrder reTestOrder;
-                    BigDecimal totalQty = BigDecimal.ZERO;
-                    if (CollectionUtils.isEmpty(reTestOrderList)) {
-                        //如果有不同create_seq
-                        if(sameCreateSeqOrder.keySet().size() > 1 ){
-                            for  (ErpMaterialOutOrder erpMaterialOutOrder : documentIdList) {
-                                asyncDuplicateSeqList.add(erpMaterialOutOrder.getSeq());
-                            }
-                            continue;
-                        }
-                        reTestOrder = new ReTestOrder();
-                        reTestOrder.setName(documentId);
-                        reTestOrder.setStatus(Document.STATUS_OPEN);
-                        reTestOrder.setReserved31(ErpMaterialOutOrder.SOURCE_TABLE_NAME);
-                    } else {
-                        reTestOrder = reTestOrderList.get(0);
-                        totalQty = reTestOrder.getQty();
-                        boolean differentCreateSeq = false;
-                        for  (String createSeq : sameCreateSeqOrder.keySet()) {
-                            if(!createSeq.equals(reTestOrder.getReserved32())){
-                                differentCreateSeq = true;
-                                for  (ErpMaterialOutOrder erpMaterialOutOrder : documentIdList) {
-                                    asyncDuplicateSeqList.add(erpMaterialOutOrder.getSeq());
-                                }
-                                break;
-                            }
-                        }
-                        if(differentCreateSeq){
-                            continue;
-                        }
-                    }
-                    reTestOrder.setName(documentId);
-
-                    List<DocumentLine> documentLines = Lists.newArrayList();
-                    for  (ErpMaterialOutOrder erpMaterialOutOrder : documentIdMap.get(documentId)) {
-                        try {
-                            DocumentLine documentLine = null;
-                            if (reTestOrder.getObjectRrn() != null) {
-                                documentLine = documentLineRepository.findByDocRrnAndReserved1(reTestOrder.getObjectRrn(), String.valueOf(erpMaterialOutOrder.getSeq()));
-                                if (documentLine != null) {
-                                    if (ErpSo.SYNC_STATUS_CHANGED.equals(erpMaterialOutOrder.getSynStatus())) {
-                                        if (documentLine != null && documentLine.getHandledQty().compareTo(erpMaterialOutOrder.getIquantity()) > 0) {
-                                            throw new ClientException("gc.order_handled_qty_gt_qty");
-                                        }
-                                    }
-                                }
-                            }
-                            // 当系统中已经同步过这个数据，则除了数量栏位，其他都不能改
-                            if (documentLine == null) {
-                                documentLine = new DocumentLine();
-                                Material material = mmsService.getProductByName(erpMaterialOutOrder.getCinvcode());
-                                if (material == null) {
-                                    throw new ClientParameterException(MM_PRODUCT_ID_IS_NOT_EXIST, erpMaterialOutOrder.getCinvcode());
-                                }
-                                documentLine.setDocId(documentId);
-                                documentLine.setErpCreated(DateUtils.parseDate(erpMaterialOutOrder.getDdate()));
-                                documentLine.setMaterialRrn(material.getObjectRrn());
-                                documentLine.setMaterialName(material.getName());
-                                documentLine.setReserved1(String.valueOf(erpMaterialOutOrder.getSeq()));
-                                documentLine.setReserved2(erpMaterialOutOrder.getSecondcode());
-                                documentLine.setReserved3(erpMaterialOutOrder.getGrade());
-                                documentLine.setReserved4(erpMaterialOutOrder.getCfree3());
-                                documentLine.setReserved5(erpMaterialOutOrder.getCmaker());
-                                documentLine.setReserved6(erpMaterialOutOrder.getChandler());
-                                documentLine.setReserved7(erpMaterialOutOrder.getOther1());
-                                documentLine.setReserved8(erpMaterialOutOrder.getCusname());
-                                documentLine.setReserved9(ReTestOrder.CATEGORY_RETEST);
-                                documentLine.setReserved13(erpMaterialOutOrder.getCmemo());
-                                documentLine.setReserved31(ErpMaterialOutOrder.SOURCE_TABLE_NAME);
-
-                            }
-
-                            totalQty = totalQty.add(erpMaterialOutOrder.getIquantity().subtract(documentLine.getQty()));
-                            documentLine.setQty(erpMaterialOutOrder.getIquantity());
-                            documentLine.setUnHandledQty(documentLine.getQty().subtract(documentLine.getHandledQty()));
-                            documentLines.add(documentLine);
-
-                            reTestOrder.setOwner(erpMaterialOutOrder.getChandler());
-                            reTestOrder.setReserved32(erpMaterialOutOrder.getCreateSeq());
-                            asyncSuccessSeqList.add(erpMaterialOutOrder.getSeq());
-                        } catch (Exception e) {
-                            // 修改状态为2
-                            erpMaterialOutOrder.setUserId(Document.SYNC_USER_ID);
-                            erpMaterialOutOrder.setSynStatus(ErpSo.SYNC_STATUS_SYNC_ERROR);
-                            erpMaterialOutOrder.setErrorMemo(e.getMessage());
-                            erpMaterialOutOrderRepository.save(erpMaterialOutOrder);
-                        }
-                    }
-                    if(totalQty.compareTo(BigDecimal.ZERO) > 0){
-                        reTestOrder.setQty(totalQty);
-                        reTestOrder.setUnHandledQty(reTestOrder.getQty().subtract(reTestOrder.getHandledQty()));
-                        reTestOrder.setReserved31(ErpMaterialOutOrder.SOURCE_TABLE_NAME);
-                        reTestOrder = (ReTestOrder) baseService.saveEntity(reTestOrder);
-                    }
-
-                    for (DocumentLine documentLine : documentLines) {
-                        documentLine.setDoc(reTestOrder);
-                        baseService.saveEntity(documentLine);
-                    }
-
-                    // 保存单据的时候同步下客户
-                    if (!StringUtils.isNullOrEmpty(reTestOrder.getSupplierName())) {
-                        savaCustomer(reTestOrder.getSupplierName());
-                    }
-                }
-                if (CollectionUtils.isNotEmpty(asyncSuccessSeqList)) {
-                    if(asyncSuccessSeqList.size() >= Document.SEQ_MAX_LENGTH){
-                        List<List<Long>> asyncSuccessSeqGroupList = getSeqListGroupByCount(asyncSuccessSeqList);
-                        for(List seqGroup : asyncSuccessSeqGroupList){
-                            erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_SUCCESS, StringUtils.EMPTY, Document.SYNC_USER_ID, seqGroup);
-                        }
-                    } else {
-                        erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_SUCCESS, StringUtils.EMPTY, Document.SYNC_USER_ID, asyncSuccessSeqList);
-                    }
-                }
-                if (CollectionUtils.isNotEmpty(asyncDuplicateSeqList)) {
-                    if(asyncDuplicateSeqList.size() >= Document.SEQ_MAX_LENGTH){
-                        List<List<Long>> asyncDuplicateSeqGroupList = getSeqListGroupByCount(asyncDuplicateSeqList);
-                        for(List seqGroup : asyncDuplicateSeqGroupList){
-                            erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_ERROR, ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID, Document.SYNC_USER_ID, seqGroup);
-                        }
-                    } else {
-                        erpMaterialOutOrderRepository.updateSynStatusAndErrorMemoAndUserIdBySeq(ErpSo.SYNC_STATUS_SYNC_ERROR, ErpMaterialOutOrder.ERROR_CODE_DUPLICATE_DOC_ID, Document.SYNC_USER_ID, asyncDuplicateSeqList);
-                    }
-                }
-            }
+            documentLine.setReserved1(String.valueOf(erpMaterialOutOrder.getSeq()));
+            documentLine.setReserved2(erpMaterialOutOrder.getSecondcode());
+            documentLine.setReserved3(erpMaterialOutOrder.getGrade());
+            documentLine.setReserved4(erpMaterialOutOrder.getCfree3());
+            documentLine.setReserved5(erpMaterialOutOrder.getCmaker());
+            documentLine.setReserved6(erpMaterialOutOrder.getChandler());
+            documentLine.setReserved7(erpMaterialOutOrder.getOther1());
+            documentLine.setReserved8(erpMaterialOutOrder.getCusname());
+            documentLine.setReserved13(erpMaterialOutOrder.getCmemo());
+            documentLine.setReserved10(erpMaterialOutOrder.getGCode());
+            documentLine.setDocType(erpMaterialOutOrder.getCvouchtype());
+            documentLine.setDocName(erpMaterialOutOrder.getCvouchname());
+            documentLine.setDocBusType(erpMaterialOutOrder.getCbustype());
+            documentLine.setDocSource(erpMaterialOutOrder.getCsource());
+            documentLine.setWarehouseCode(erpMaterialOutOrder.getCwhcode());
+            documentLine.setWarehouseName(erpMaterialOutOrder.getCwhName());
+            documentLine.setReserved11(erpMaterialOutOrder.getGName());
+            documentLine.setReserved12(erpMaterialOutOrder.getOther8());
+            documentLine.setReserved15(erpMaterialOutOrder.getOther18());
+            documentLine.setReserved17(erpMaterialOutOrder.getOther3());
+            documentLine.setReserved20(erpMaterialOutOrder.getOther9());
+            documentLine.setReserved21(erpMaterialOutOrder.getOther10());
+            documentLine.setReserved27(erpMaterialOutOrder.getOther7());
+            documentLine.setReserved30(erpMaterialOutOrder.getOther5());
+            documentLine.setCuscode(erpMaterialOutOrder.getCuscode());
+            documentLine.setProductType(erpMaterialOutOrder.getOther15());
+            documentLine.setPoId(erpMaterialOutOrder.getCfree4());
+            documentLine.setCrdCode(erpMaterialOutOrder.getCrdcode());
+            documentLine.setCrdName(erpMaterialOutOrder.getCrdname());
+            documentLine.setAutoid(erpMaterialOutOrder.getOther16());
+            documentLine.setReserved31(ErpMaterialOutOrder.SOURCE_TABLE_NAME);
         } catch (Exception e) {
             throw ExceptionManager.handleException(e, log);
         }
@@ -1643,7 +1671,8 @@ public class GcServiceImpl implements GcService {
         try {
             for (MaterialLot materialLot : materialLots) {
                 String importType = materialLot.getReserved49();
-                if (MaterialLot.IMPORT_LCD_CP.equals(importType) || MaterialLot.IMPORT_SENSOR_CP.equals(importType) || MaterialLot.IMPORT_WLA.equals(importType)) {
+                if (MaterialLot.IMPORT_LCD_CP.equals(importType) || MaterialLot.IMPORT_SENSOR_CP.equals(importType)
+                        || MaterialLot.IMPORT_WLA.equals(importType) || MaterialLot.IMPORT_SOC.equals(importType)) {
                     materialLot.setCurrentSubQty(BigDecimal.ZERO);
                     mmsService.changeMaterialLotState(materialLot, GCMaterialEvent.EVENT_WAFER_ISSUE, StringUtils.EMPTY);
                     materialLotInventoryRepository.deleteByMaterialLotRrn(materialLot.getObjectRrn());
@@ -1858,7 +1887,7 @@ public class GcServiceImpl implements GcService {
                         if (materialLot.getCurrentSubQty().compareTo(BigDecimal.ZERO) == 0) {
                             //数量进行还原。不能扣减。
                             materialLot.setCurrentSubQty(mLotQty.get(materialLot.getMaterialLotId()));
-                            List<MaterialLotUnit> receiveUnits = materialLotUnitService.receiveMLotWithUnit(materialLot, WAREHOUSE_ZJ);
+                            materialLotUnitService.receiveMLotWithUnit(materialLot, WAREHOUSE_ZJ);
                             iterator.remove();
                         }
                     } else {
@@ -1874,7 +1903,7 @@ public class GcServiceImpl implements GcService {
                         if (materialLot.getCurrentQty().compareTo(BigDecimal.ZERO) == 0) {
                             //数量进行还原。不能扣减。
                             materialLot.setCurrentQty(mLotQty.get(materialLot.getMaterialLotId()));
-                            List<MaterialLotUnit> receiveUnits = materialLotUnitService.receiveMLotWithUnit(materialLot, WAREHOUSE_ZJ);
+                            materialLotUnitService.receiveMLotWithUnit(materialLot, WAREHOUSE_ZJ);
                             iterator.remove();
                         }
                     }
@@ -1912,14 +1941,18 @@ public class GcServiceImpl implements GcService {
      * @param materialLotActions
      * @throws ClientException
      */
-    public void reTest(List<DocumentLine> documentLineList, List<MaterialLotAction> materialLotActions) throws ClientException{
+    public void reTest(List<DocumentLine> documentLineList, List<MaterialLotAction> materialLotActions, String retestType) throws ClientException{
         try {
             List<MaterialLot> materialLots = materialLotActions.stream().map(materialLotAction -> mmsService.getMLotByMLotId(materialLotAction.getMaterialLotId(), true)).collect(Collectors.toList());
             //将装箱的物料批次筛选出来
             materialLots = packageService.getWaitPackMaterialLots(materialLots);
+            String docRuleName = MaterialLot.MLOT_RETEST_DOC_VALIDATE_RULE_ID;
+            if(MaterialLot.RETEST_TYPE_FT.equals(retestType)){
+                docRuleName = MaterialLot.FT_RETEST_DOC_VALIDATE_RULE_ID;
+            }
             documentLineList = documentLineList.stream().map(documentLine -> (DocumentLine)documentLineRepository.findByObjectRrn(documentLine.getObjectRrn())).collect(Collectors.toList());
-            Map<String, List<DocumentLine>> documentLineMap = groupDocLineByMLotDocRule(documentLineList, MaterialLot.MLOT_RETEST_DOC_VALIDATE_RULE_ID);
-            Map<String, List<MaterialLot>> materialLotMap = groupMaterialLotByMLotDocRule(materialLots, MaterialLot.MLOT_RETEST_DOC_VALIDATE_RULE_ID);
+            Map<String, List<DocumentLine>> documentLineMap = groupDocLineByMLotDocRule(documentLineList, docRuleName);
+            Map<String, List<MaterialLot>> materialLotMap = groupMaterialLotByMLotDocRule(materialLots, docRuleName);
 
             // 确保所有的物料批次都能匹配上单据, 并且数量足够
             for (String key : materialLotMap.keySet()) {
@@ -1931,12 +1964,11 @@ public class GcServiceImpl implements GcService {
                 if (totalMaterialLotQty.compareTo(totalUnhandledQty) > 0) {
                     throw new ClientException(GcExceptions.OVER_DOC_QTY);
                 }
-                reTestMaterialLots(documentLineMap.get(key), materialLotMap.get(key));
+                reTestMaterialLots(documentLineMap.get(key), materialLotMap.get(key), retestType);
             }
         } catch (Exception e) {
             throw ExceptionManager.handleException(e, log);
         }
-
     }
 
     /**
@@ -1952,7 +1984,7 @@ public class GcServiceImpl implements GcService {
             if (CollectionUtils.isEmpty(documentLineList)){
                 throw new ClientException(GcExceptions.RAW_DOCUMENT_LINE_IS_EMPTY);
             }
-            reTest(documentLineList, materialLotActions);
+            reTest(documentLineList, materialLotActions, MaterialLot.RETEST_TYPE_COM);
         } catch (Exception e) {
             throw ExceptionManager.handleException(e, log);
         }
@@ -1964,11 +1996,10 @@ public class GcServiceImpl implements GcService {
      * @param materialLots
      * @throws ClientException
      */
-    private void reTestMaterialLots(List<DocumentLine> documentLines, List<MaterialLot> materialLots) throws ClientException{
+    private void reTestMaterialLots(List<DocumentLine> documentLines, List<MaterialLot> materialLots, String retestType) throws ClientException{
         try {
             documentLines = vlidateDocMergeAndSortDocumentLinesBySeq(documentLines);
             for (DocumentLine documentLine: documentLines) {
-
                 BigDecimal unhandedQty = documentLine.getUnHandledQty();
                 Iterator<MaterialLot> iterator = materialLots.iterator();
                 while (iterator.hasNext()) {
@@ -2015,28 +2046,53 @@ public class GcServiceImpl implements GcService {
                     documentLine = documentLineRepository.saveAndFlush(documentLine);
                     baseService.saveHistoryEntity(documentLine, GCMaterialEvent.EVENT_RETEST);
 
-                    ReTestOrder reTestOrder = (ReTestOrder) reTestOrderRepository.findByObjectRrn(documentLine.getDocRrn());
-                    reTestOrder.setHandledQty(reTestOrder.getHandledQty().add(handledQty));
-                    reTestOrder.setUnHandledQty(reTestOrder.getUnHandledQty().subtract(handledQty));
-                    reTestOrder = reTestOrderRepository.saveAndFlush(reTestOrder);
-                    baseService.saveHistoryEntity(reTestOrder, GCMaterialEvent.EVENT_RETEST);
+                    if(MaterialLot.RETEST_TYPE_COM.equals(retestType)){
+                        ReTestOrder reTestOrder = (ReTestOrder) reTestOrderRepository.findByObjectRrn(documentLine.getDocRrn());
+                        reTestOrder.setHandledQty(reTestOrder.getHandledQty().add(handledQty));
+                        reTestOrder.setUnHandledQty(reTestOrder.getUnHandledQty().subtract(handledQty));
+                        reTestOrder = reTestOrderRepository.saveAndFlush(reTestOrder);
+                        baseService.saveHistoryEntity(reTestOrder, GCMaterialEvent.EVENT_RETEST);
 
-                    Optional<ErpMaterialOutOrder> erpMaterialOutOrderOptional = erpMaterialOutOrderRepository.findById(Long.valueOf(documentLine.getReserved1()));
-                    if (!erpMaterialOutOrderOptional.isPresent()) {
-                        throw new ClientParameterException(GcExceptions.ERP_RETEST_ORDER_IS_NOT_EXIST, documentLine.getReserved1());
-                    }
+                        Optional<ErpMaterialOutOrder> erpMaterialOutOrderOptional = erpMaterialOutOrderRepository.findById(Long.valueOf(documentLine.getReserved1()));
+                        if (!erpMaterialOutOrderOptional.isPresent()) {
+                            throw new ClientParameterException(GcExceptions.ERP_RETEST_ORDER_IS_NOT_EXIST, documentLine.getReserved1());
+                        }
 
-                    ErpMaterialOutOrder erpMaterialOutOrder = erpMaterialOutOrderOptional.get();
-                    erpMaterialOutOrder.setSynStatus(ErpMaterialOutOrder.SYNC_STATUS_OPERATION);
-                    erpMaterialOutOrder.setLeftNum(erpMaterialOutOrder.getLeftNum().subtract(handledQty));
-                    if (StringUtils.isNullOrEmpty(erpMaterialOutOrder.getDeliveredNum())) {
-                        erpMaterialOutOrder.setDeliveredNum(handledQty.toPlainString());
-                    } else {
-                        BigDecimal docHandledQty = new BigDecimal(erpMaterialOutOrder.getDeliveredNum());
-                        docHandledQty = docHandledQty.add(handledQty);
-                        erpMaterialOutOrder.setDeliveredNum(docHandledQty.toPlainString());
+                        ErpMaterialOutOrder erpMaterialOutOrder = erpMaterialOutOrderOptional.get();
+                        erpMaterialOutOrder.setSynStatus(ErpMaterialOutOrder.SYNC_STATUS_OPERATION);
+                        erpMaterialOutOrder.setLeftNum(erpMaterialOutOrder.getLeftNum().subtract(handledQty));
+                        if (StringUtils.isNullOrEmpty(erpMaterialOutOrder.getDeliveredNum())) {
+                            erpMaterialOutOrder.setDeliveredNum(handledQty.toPlainString());
+                        } else {
+                            BigDecimal docHandledQty = new BigDecimal(erpMaterialOutOrder.getDeliveredNum());
+                            docHandledQty = docHandledQty.add(handledQty);
+                            erpMaterialOutOrder.setDeliveredNum(docHandledQty.toPlainString());
+                        }
+                        erpMaterialOutOrderRepository.save(erpMaterialOutOrder);
+                    } else if(MaterialLot.RETEST_TYPE_FT.equals(retestType)){
+                        FtRetestOrder ftRetestOrder = (FtRetestOrder) ftRetestOrderRepository.findByObjectRrn(documentLine.getDocRrn());
+                        ftRetestOrder.setHandledQty(ftRetestOrder.getHandledQty().add(handledQty));
+                        ftRetestOrder.setUnHandledQty(ftRetestOrder.getUnHandledQty().subtract(handledQty));
+                        ftRetestOrder = ftRetestOrderRepository.saveAndFlush(ftRetestOrder);
+                        baseService.saveHistoryEntity(ftRetestOrder, GCMaterialEvent.EVENT_RETEST);
+
+                        Optional<ErpMaterialOutaOrder> erpMaterialOutaOrderOptional = erpMaterialOutAOrderRepository.findById(Long.valueOf(documentLine.getReserved1()));
+                        if (!erpMaterialOutaOrderOptional.isPresent()) {
+                            throw new ClientParameterException(GcExceptions.ERP_RETEST_ORDER_IS_NOT_EXIST, documentLine.getReserved1());
+                        }
+
+                        ErpMaterialOutaOrder erpMaterialOutaOrder = erpMaterialOutaOrderOptional.get();
+                        erpMaterialOutaOrder.setSynStatus(ErpMaterialOutOrder.SYNC_STATUS_OPERATION);
+                        erpMaterialOutaOrder.setLeftNum(erpMaterialOutaOrder.getLeftNum().subtract(handledQty));
+                        if (StringUtils.isNullOrEmpty(erpMaterialOutaOrder.getDeliveredNum())) {
+                            erpMaterialOutaOrder.setDeliveredNum(handledQty.toPlainString());
+                        } else {
+                            BigDecimal docHandledQty = new BigDecimal(erpMaterialOutaOrder.getDeliveredNum());
+                            docHandledQty = docHandledQty.add(handledQty);
+                            erpMaterialOutaOrder.setDeliveredNum(docHandledQty.toPlainString());
+                        }
+                        erpMaterialOutAOrderRepository.save(erpMaterialOutaOrder);
                     }
-                    erpMaterialOutOrderRepository.save(erpMaterialOutOrder);
                 }
             }
         } catch (Exception e) {
@@ -2559,6 +2615,10 @@ public class GcServiceImpl implements GcService {
                 documentLine.setDocSource(erpSo.getCsource());
                 documentLine.setWarehouseCode(erpSo.getCwhcode());
                 documentLine.setWarehouseName(erpSo.getCwhname());
+                documentLine.setProductType(erpSo.getOther15());
+                documentLine.setCrdCode(erpSo.getCrdcode());
+                documentLine.setCrdName(erpSo.getCrdname());
+                documentLine.setCuscode(erpSo.getCuscode());
                 documentLine.setReserved31(ErpSo.SOURCE_TABLE_NAME);
             }
             return documentLine;
@@ -3264,15 +3324,12 @@ public class GcServiceImpl implements GcService {
                 otherReceiveProps.put("reserved50", MaterialLot.COM_WAFER_SOURCE);
                 otherReceiveProps.put("reserved7", productCategory);
             } else if(MaterialLotUnit.PRODUCT_CATEGORY_WLT.equals(productCategory)){
-                if(MaterialLot.MM_PACKED_LOTIN_FLAG.equals(inFlag)){
-                    otherReceiveProps.put("reserved7", MaterialLot.WLT_IN_FLAG_PRODUCTCATEGORY);
-                } else {
-                    otherReceiveProps.put("reserved7", productCategory);
-                }
                 if(productId.endsWith("-2.5")){
                     otherReceiveProps.put("reserved50", MaterialLot.WLT_IN_FLAG_WAFER_SOURCE);
+                    otherReceiveProps.put("reserved7", MaterialLot.WLT_IN_FLAG_PRODUCTCATEGORY);
                 } else if(productId.endsWith("-2.6")){
                     otherReceiveProps.put("reserved50", MaterialLot.WLT_WAFER_SOURCE);
+                    otherReceiveProps.put("reserved7", productCategory);
                 } else {
                     otherReceiveProps.put("reserved50", MaterialLot.ERROR_WAFER_SOUCE);
                 }
@@ -3318,6 +3375,19 @@ public class GcServiceImpl implements GcService {
             } else if(MaterialLotUnit.PRODUCT_CATEGORY_FT_COB.equals(productCategory)){
                 otherReceiveProps.put("reserved50", MaterialLot.COB_WAFER_SOURCE);
                 otherReceiveProps.put("reserved7", productCategory);
+            }else if(MaterialLotUnit.PRODUCT_CATEGORY_SOC.equals(productCategory)){
+                if(MaterialLot.MM_PACKED_LOTIN_FLAG.equals(inFlag)){
+                    otherReceiveProps.put("reserved7", MaterialLotUnit.PRODUCT_CLASSIFY_SOC);
+                } else {
+                    otherReceiveProps.put("reserved7", productCategory);
+                }
+                if(productId.endsWith("-2.6")){
+                    otherReceiveProps.put("reserved50", MaterialLot.SOC_WAFER_SOURCE_MEASURE);
+                } else if(productId.endsWith("-2.5") || productId.endsWith("-2.55") ){
+                    otherReceiveProps.put("reserved50", MaterialLot.SOC_WAFER_SOURCE_UNMEASUREN);
+                } else {
+                    otherReceiveProps.put("reserved50", MaterialLot.ERROR_WAFER_SOUCE);
+                }
             }
         } catch (Exception e) {
             throw ExceptionManager.handleException(e, log);
@@ -4225,6 +4295,8 @@ public class GcServiceImpl implements GcService {
                 }
                 materialLot.setReserved14(storageId);
                 materialLotRepository.save(materialLot);
+
+
             }
 
         } catch (Exception e) {
@@ -4393,8 +4465,8 @@ public class GcServiceImpl implements GcService {
                         materialLotHistoryRepository.save(history);
                     }
                 }
-            } else if(importType.equals(MaterialLotUnit.RMA_GOOD_PRODUCT) || importType.equals(MaterialLotUnit.RMA_RETURN)
-                    ||importType.equals(MaterialLotUnit.RMA_PURE)){
+            } else if(importType.equals(MaterialLotUnit.SENSOR_RMA_GOOD_PRODUCT) || importType.equals(MaterialLotUnit.RMA_RETURN)
+                    ||importType.equals(MaterialLotUnit.RMA_PURE) || importType.equals(MaterialLotUnit.WLT_RMA_GOOD_PRODUCT)){
                 importCode = generatorMLotsTransId(MaterialLot.GENERATOR_INCOMING_MLOT_IMPORT_CODE_RULE);
                 Map<String, List<MaterialLot>> materialLotMap = materialLotList.stream().collect(Collectors.groupingBy(MaterialLot:: getMaterialName));
                 for(String materialName : materialLotMap.keySet()){
@@ -4422,17 +4494,23 @@ public class GcServiceImpl implements GcService {
                         materialLot.setStatusModelRrn(material.getStatusModelRrn());
                         materialLot.setStatusCategory(MaterialStatus.STATUS_CREATE);
                         materialLot.setStatus(MaterialStatus.STATUS_CREATE);
-                        materialLot.setReserved7(MaterialLotUnit.PRODUCT_CLASSIFY_RMA);
                         if(StringUtils.isNullOrEmpty(materialLot.getReserved35())){
                             materialLot.setReserved35("0");
                         }
-                        if(MaterialLotUnit.RMA_GOOD_PRODUCT.equals(importType)){
-                            materialLot.setReserved50("11");
-                            materialLot.setReserved49(MaterialLot.IMPORT_RMA);
+                        if(MaterialLotUnit.SENSOR_RMA_GOOD_PRODUCT.equals(importType)){
+                            materialLot.setReserved7(MaterialLotUnit.PRODUCT_CATEGORY_RMA);
+                            materialLot.setReserved50(MaterialLot.SENSOR_WAFER_SOURCE);
+                            materialLot.setReserved49(MaterialLot.IMPORT_SENSOR);
+                        } else if(MaterialLotUnit.WLT_RMA_GOOD_PRODUCT.equals(importType)){
+                            materialLot.setReserved7(MaterialLotUnit.PRODUCT_CATEGORY_RMA);
+                            materialLot.setReserved50(MaterialLot.WLT_PACK_RETURN_WAFER_SOURCE);
+                            materialLot.setReserved49(MaterialLot.IMPORT_WLT);
                         } else if(MaterialLotUnit.RMA_RETURN.equals(importType)){
+                            materialLot.setReserved7(MaterialLotUnit.PRODUCT_CLASSIFY_RMA);
                             materialLot.setReserved50("12");
                             materialLot.setReserved49(MaterialLot.IMPORT_RETURN);
                         } else if(MaterialLotUnit.RMA_PURE.equals(importType)){
+                            materialLot.setReserved7(MaterialLotUnit.PRODUCT_CLASSIFY_RMA);
                             materialLot.setReserved50("15");
                             materialLot.setReserved49(MaterialLot.IMPORT_CRMA);
                         }
@@ -5931,7 +6009,6 @@ public class GcServiceImpl implements GcService {
      */
     public void purchaseOutsourceWaferReceive(List<MaterialLotAction> materialLotActions) throws ClientException{
         try {
-            List<MaterialLotUnit> materialLotUnits = Lists.newArrayList();
             List<MaterialLot> materialLots = materialLotActions.stream().map(materialLotAction -> mmsService.getMLotByMLotId(materialLotAction.getMaterialLotId(), true)).collect(Collectors.toList());
             Warehouse warehouse = new Warehouse();
             for(MaterialLot materialLot : materialLots){
@@ -5944,8 +6021,7 @@ public class GcServiceImpl implements GcService {
                 String warehouseName = warehouse.getName();
 
                 log.info("receive materialLot and materialLotUnits");
-                List<MaterialLotUnit> units = materialLotUnitService.receiveMLotWithUnit(materialLot, warehouseName);
-                materialLotUnits.addAll(units);
+                materialLotUnitService.receiveMLotWithUnit(materialLot, warehouseName);
             }
 
             for(MaterialLot materialLot : materialLots){
@@ -6891,6 +6967,29 @@ public class GcServiceImpl implements GcService {
             documentLine.setReserved13(erpMaterialOutaOrder.getCmemo());
             documentLine.setMaterialType(erpMaterialOutaOrder.getCfree4());
             documentLine.setReserved31(ErpMaterialOutaOrder.SOURCE_TABLE_NAME);
+            documentLine.setReserved4(erpMaterialOutaOrder.getCfree3());
+            documentLine.setReserved8(erpMaterialOutaOrder.getCusname());
+            documentLine.setReserved10(erpMaterialOutaOrder.getGCode());
+            documentLine.setDocType(erpMaterialOutaOrder.getCvouchtype());
+            documentLine.setDocName(erpMaterialOutaOrder.getCvouchname());
+            documentLine.setDocBusType(erpMaterialOutaOrder.getCbustype());
+            documentLine.setDocSource(erpMaterialOutaOrder.getCsource());
+            documentLine.setWarehouseCode(erpMaterialOutaOrder.getCwhcode());
+            documentLine.setWarehouseName(erpMaterialOutaOrder.getCwhname());
+            documentLine.setReserved11(erpMaterialOutaOrder.getGName());
+            documentLine.setReserved12(erpMaterialOutaOrder.getOther8());
+            documentLine.setReserved15(erpMaterialOutaOrder.getOther18());
+            documentLine.setReserved17(erpMaterialOutaOrder.getOther3());
+            documentLine.setReserved20(erpMaterialOutaOrder.getOther9());
+            documentLine.setReserved21(erpMaterialOutaOrder.getOther10());
+            documentLine.setReserved27(erpMaterialOutaOrder.getOther7());
+            documentLine.setReserved28(erpMaterialOutaOrder.getOther4());
+            documentLine.setReserved30(erpMaterialOutaOrder.getOther5());
+            documentLine.setCrdCode(erpMaterialOutaOrder.getCrdcode());
+            documentLine.setCrdName(erpMaterialOutaOrder.getCrdname());
+            documentLine.setAutoid(erpMaterialOutaOrder.getOther16());
+            documentLine.setCuscode(erpMaterialOutaOrder.getCuscode());
+            documentLine.setProductType(erpMaterialOutaOrder.getOther15());
         } catch (Exception e) {
             throw  ExceptionManager.handleException(e, log);
         }
@@ -7057,6 +7156,111 @@ public class GcServiceImpl implements GcService {
     }
 
     /**
+     * FT重测发料单
+     * @throws ClientException
+     */
+    public void asyncFtRetestIssueOrder() throws ClientException {
+        try {
+            List<ErpMaterialOutaOrder> materialIssueOrders = erpMaterialOutAOrderRepository.findByTypeAndSynStatusNotIn(ErpMaterialOutaOrder.TYPE_RT, Lists.newArrayList(ErpSo.SYNC_STATUS_OPERATION, ErpSo.SYNC_STATUS_SYNC_ERROR, ErpSo.SYNC_STATUS_SYNC_SUCCESS));
+            List<Long> asyncSuccessSeqList = Lists.newArrayList();
+            List<Long> asyncDuplicateSeqList = Lists.newArrayList();
+            if (CollectionUtils.isNotEmpty(materialIssueOrders)) {
+                Map<String, List<ErpMaterialOutaOrder>> documentIdMap = materialIssueOrders.stream().collect(Collectors.groupingBy(ErpMaterialOutaOrder :: getCcode));
+                for (String documentId : documentIdMap.keySet()) {
+                    List<ErpMaterialOutaOrder> documentIdList = documentIdMap.get(documentId);
+                    Map<String, List<ErpMaterialOutaOrder>> sameCreateSeqOrder = documentIdList.stream().filter(erpMaterialOutaOrder -> !StringUtils.isNullOrEmpty(erpMaterialOutaOrder.getCreateSeq()))
+                            .collect(Collectors.groupingBy(ErpMaterialOutaOrder :: getCreateSeq));
+                    List<FtRetestOrder> ftRetestOrders = ftRetestOrderRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
+                    if(CollectionUtils.isEmpty(ftRetestOrders)){
+                        List<Document> documentList = documentRepository.findByNameAndOrgRrn(documentId, ThreadLocalContext.getOrgRrn());
+                        if(CollectionUtils.isNotEmpty(documentList)){
+                            updateErpMaterialOutAErrorInfo(documentIdList);
+                            continue;
+                        }
+                    }
+                    FtRetestOrder ftRetestOrder;
+                    BigDecimal totalQty = BigDecimal.ZERO;
+                    if (CollectionUtils.isEmpty(ftRetestOrders)) {
+                        if(sameCreateSeqOrder.keySet().size() > 1 ){
+                            for  (ErpMaterialOutaOrder erpMOutaOrder : documentIdList) {
+                                asyncDuplicateSeqList.add(erpMOutaOrder.getSeq());
+                            }
+                            continue;
+                        }
+                        ftRetestOrder = new FtRetestOrder();
+                        ftRetestOrder.setName(documentId);
+                        ftRetestOrder.setStatus(Document.STATUS_OPEN);
+                        ftRetestOrder.setReserved31(ErpMaterialOutaOrder.SOURCE_TABLE_NAME);
+                    } else {
+                        ftRetestOrder = ftRetestOrders.get(0);
+                        totalQty = ftRetestOrder.getQty();
+                        boolean createSeqFlag = false;
+                        for  (String createSeq : sameCreateSeqOrder.keySet()) {
+                            if(!createSeq.equals(ftRetestOrder.getReserved32())){
+                                createSeqFlag = true;
+                                for  (ErpMaterialOutaOrder erpMaterialOutaOrder : documentIdList) {
+                                    asyncDuplicateSeqList.add(erpMaterialOutaOrder.getSeq());
+                                }
+                                break;
+                            }
+                        }
+                        if(createSeqFlag){
+                            continue;
+                        }
+                    }
+
+                    ftRetestOrder.setName(documentId);
+                    List<DocumentLine> documentLineList = Lists.newArrayList();
+                    for  (ErpMaterialOutaOrder materialOutaOrder : documentIdMap.get(documentId)) {
+                        try {
+                            DocumentLine documentLine = null;
+                            if (ftRetestOrder.getObjectRrn() != null) {
+                                validationIssueOrderQty(ftRetestOrder.getObjectRrn(), materialOutaOrder);
+                            }
+                            if (documentLine == null) {
+                                documentLine = new DocumentLine();
+                                setIssueOrderInfoToDocumentLine(documentLine, materialOutaOrder);
+                                documentLine.setReserved9(FtRetestOrder.CATEGORY_FT_RETEST);
+                                documentLine.setDocId(documentId);
+                            }
+                            totalQty = totalQty.add(materialOutaOrder.getIquantity().subtract(documentLine.getQty()));
+                            documentLine.setQty(materialOutaOrder.getIquantity());
+                            documentLine.setUnReservedQty(documentLine.getQty().subtract(documentLine.getReservedQty()));
+                            documentLine.setUnHandledQty(documentLine.getQty().subtract(documentLine.getHandledQty()));
+                            documentLineList.add(documentLine);
+
+                            ftRetestOrder.setReserved32(materialOutaOrder.getCreateSeq());
+                            ftRetestOrder.setOwner(materialOutaOrder.getChandler());
+                            asyncSuccessSeqList.add(materialOutaOrder.getSeq());
+                        } catch (Exception e) {
+                            materialOutaOrder.setUserId(Document.SYNC_USER_ID);
+                            materialOutaOrder.setErrorMemo(e.getMessage());
+                            materialOutaOrder.setSynStatus(ErpSo.SYNC_STATUS_SYNC_ERROR);
+                            erpMaterialOutAOrderRepository.save(materialOutaOrder);
+                        }
+                    }
+                    if(totalQty.compareTo(BigDecimal.ZERO) > 0){
+                        ftRetestOrder.setQty(totalQty);
+                        ftRetestOrder.setUnHandledQty(ftRetestOrder.getQty().subtract(ftRetestOrder.getHandledQty()));
+                        ftRetestOrder.setUnReservedQty(ftRetestOrder.getQty().subtract(ftRetestOrder.getReservedQty()));
+
+                        ftRetestOrder.setReserved31(ErpMaterialOutaOrder.SOURCE_TABLE_NAME);
+                        ftRetestOrder = (FtRetestOrder) baseService.saveEntity(ftRetestOrder);
+                    }
+
+                    for (DocumentLine documentLine : documentLineList) {
+                        documentLine.setDoc(ftRetestOrder);
+                        baseService.saveEntity(documentLine);
+                    }
+                }
+                updateErpMaterialOutASyncStatusAndErrorMemoAndUserId(asyncSuccessSeqList, asyncDuplicateSeqList);
+            }
+        } catch (Exception e) {
+            throw ExceptionManager.handleException(e, log);
+        }
+    }
+
+    /**
      * 同步失败，保存同步错误信息
      * @param documentIdList
      * @throws ClientException
@@ -7192,6 +7396,21 @@ public class GcServiceImpl implements GcService {
                                 documentLine.setReserved27(erpSoa.getOdm());
                                 documentLine.setReserved28(erpSoa.getOther19());
                                 documentLine.setReserved29(erpSoa.getOther18());
+                                documentLine.setDocName(erpSoa.getStcode());
+                                documentLine.setDocBusType(erpSoa.getBustype());
+                                documentLine.setReserved30(erpSoa.getOther20());
+                                documentLine.setProductType(erpSoa.getOther15());
+                                documentLine.setSaleCode(erpSoa.getDlcode());
+                                documentLine.setShipDate(erpSoa.getShipDate());
+                                documentLine.setWarehouseCode(erpSoa.getWhcode());
+                                documentLine.setWarehouseName(erpSoa.getWhname());
+                                documentLine.setShipAutoid(erpSoa.getShipAutoid());
+                                documentLine.setSaleType(erpSoa.getOther2());
+                                documentLine.setShipCustomer(erpSoa.getOther9());
+                                documentLine.setCargoCode(erpSoa.getOther10());
+                                documentLine.setReserved33(erpSoa.getOther5());
+                                documentLine.setReserved34(erpSoa.getOther7());
+                                documentLine.setReserved35(erpSoa.getOther14());
                                 documentLine.setReserved31(ErpSoa.SOURCE_TABLE_NAME);
                                 documentLine.setThreeSideTransaction(erpSoa.getCuscode());
                             }
@@ -7391,13 +7610,16 @@ public class GcServiceImpl implements GcService {
                                 documentLine.setReserved25(erpSob.getOther14());
                                 documentLine.setReserved26(erpSob.getOther15());
                                 documentLine.setReserved30(erpSob.getOther5());
-
+                                documentLine.setStockCode(erpSob.getCfree4());
                                 documentLine.setDocType(erpSob.getCvouchtype());
                                 documentLine.setDocName(erpSob.getCvouchname());
                                 documentLine.setDocBusType(erpSob.getCbustype());
                                 documentLine.setDocSource(erpSob.getCsource());
                                 documentLine.setWarehouseCode(erpSob.getCwhcode());
                                 documentLine.setWarehouseName(erpSob.getCwhname());
+                                documentLine.setCrdName(erpSob.getCrdname());
+                                documentLine.setCrdCode(erpSob.getCrdcode());
+                                documentLine.setAutoid(erpSob.getOther16());
                                 documentLine.setReserved31(ErpSob.SOURCE_TABLE_NAME);
                             }
 
@@ -7981,10 +8203,15 @@ public class GcServiceImpl implements GcService {
     private void rwLotAttributeChange(MaterialLot materialLot) throws ClientException {
         try {
             String waferSource = materialLot.getReserved50();
+            String strProdcutType = materialLot.getMaterialName();
             if (!StringUtils.isNullOrEmpty(waferSource)){
                 if (MaterialLot.RW_TO_CP_WAFER_SOURCE.equals(waferSource)) {
-                    materialLot.setReserved50(MaterialLot.SCP_WAFER_SOURCE);
-                }else if (MaterialLot.SCP_WAFER_SOURCE.equals(waferSource)){
+                    if(strProdcutType.endsWith("-2.1")){
+                        materialLot.setReserved50(MaterialLot.SCP_WAFER_SOURCE);
+                    }else {
+                        materialLot.setReserved50(MaterialLot.SCP_IN_FLAG_WAFER_SOURCE);
+                    }
+                }else if (MaterialLot.SCP_WAFER_SOURCE.equals(waferSource) || MaterialLot.SCP_IN_FLAG_WAFER_SOURCE.equals(waferSource)){
                     materialLot.setReserved50(MaterialLot.RW_TO_CP_WAFER_SOURCE);
                 }
                 if (MaterialLot.RW_WAFER_SOURCE.equals(waferSource)) {
@@ -11370,7 +11597,6 @@ public class GcServiceImpl implements GcService {
                 throw new ClientParameterException(MM_RAW_MATERIAL_IS_NOT_EXIST, bladeMaterialCode);
             }
             materialLot.setMaterial(material);
-            materialLot.setCurrentQty(BigDecimal.TEN);
             materialLot.setCurrentSubQty(BigDecimal.ONE);
             materialLot.setStatusCategory(MaterialStatus.STATUS_CREATE);
             materialLot.setStatus(MaterialStatus.STATUS_CREATE);
